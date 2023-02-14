@@ -17,9 +17,26 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <sstream>
 
 namespace po = boost::program_options;
 using std::chrono::high_resolution_clock;
+
+void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::variables_map vm);
+
+struct channel_data {
+    int16_t channel_pwr[15];
+    double lat;
+    double lon;
+};
+
+struct channel_data data;
+std::string client_crt_path = "certs/client_10.147.20.114-1.crt"; 
+std::string client_key_path = "certs/client_10.147.20.114-1.key"; 
+std::string ca_crt_path = "certs/ca.crt";
+
+
+void post_data(channel_data data, std::string url);
 
 int UHD_SAFE_MAIN(int argc, char* argv[])
 {
@@ -30,6 +47,13 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     float ref_lvl, dyn_rng;
     bool show_controls;
 
+    //initialize required variables
+    rate = 10416667;       //125e6/12
+    freq = 3555000000;       //3.555 GHz
+    gain = 80;
+
+    data.lat = 38.88095833926984;
+    data.lon = -77.11573962785668;
     // setup the program options
     po::options_description desc("Allowed options");
     // clang-format off
@@ -181,6 +205,9 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     //------------------------------------------------------------------
     //-- Main loop
     //------------------------------------------------------------------
+    
+    int i = 0;
+    bool new_data_available = false;
     while (true) {
         // read a buffer's worth of samples every iteration
         size_t num_rx_samps = rx_stream->recv(&buff.front(), buff.size(), md);
@@ -204,12 +231,24 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         for (size_t n = 0; n < num_bins; n++) {
             dft[n] = lpdft[(n + num_bins / 2) % num_bins];
         }
-
-        std::cout << "Count = " << dft.size();
+        int64_t average = 0;
+        std::cout << " Ch = " << i+1;
         for(int i = 0; i < dft.size(); i++){
-            std::cout << dft[i] << " ";
+            average = (average + dft[i])/2;
         }
-        std::cout << " End\n";
+        std::cout << " " << average;
+        data.channel_pwr[i] = average;
+        i+=1;
+        if(i > 14){
+            post_data(data, "https://10.147.20.114:1443/sas-api/measurements");
+            i = 0;
+            freq = 3555e6;   //Set to channel one center back i.e. 3.555 GHz 
+            std::cout << "\n";
+        }
+        else{
+            freq += 10e6;    //Increment frequency by 10 MHz to observe the next channel
+            set_center_frequency(freq, usrp, vm);
+        }
         
        
     }
@@ -224,4 +263,37 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     std::cout << std::endl << "Done!" << std::endl << std::endl;
 
     return EXIT_SUCCESS;
+}
+
+//Function to set the center frequency via the UHD driver
+void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::variables_map vm){
+    uhd::tune_request_t tune_request(freq);
+    if (vm.count("int-n"))
+        tune_request.args = uhd::device_addr_t("mode_n=integer");
+    usrp->set_rx_freq(tune_request);
+    //std::cout << boost::format("RX Freq: %f MHz...") % (usrp->get_rx_freq() / 1e6);
+}
+
+//Function to send HTTPS post request
+void post_data(channel_data data, std::string url) {
+    // Construct the JSON payload
+    std::stringstream json_ss;
+    json_ss << "{";
+    json_ss << "\"sensor_id\": \"CCI-xG-Sensor-01\"," ;
+    json_ss << "\"lat\":" << data.lat << ",";
+    json_ss << "\"lon\":" << data.lon << ",";
+    json_ss << "\"channels\":[";
+    for (int i = 0; i < 14; i++) {
+        json_ss << "{\"name\":\"channel" << i << "\",\"power\":" << data.channel_pwr[i] << "},";
+    }
+    json_ss << "{\"name\":\"channel14\",\"power\":" << data.channel_pwr[14] << "}";
+    json_ss << "]}";
+
+    std::string json_str = json_ss.str();
+
+    // Construct the curl command
+    std::string command = "curl -X POST -H 'Content-Type: application/json' --data '" + json_str + "' --cert " + client_crt_path + " --key " + client_key_path + " --cacert " + ca_crt_path + " " + url;
+
+    // Execute the curl command
+    system(command.c_str());
 }
