@@ -31,8 +31,8 @@ struct channel_data {
 };
 
 struct channel_data data;
-std::string client_crt_path = "certs/client_10.147.20.114-1.crt"; 
-std::string client_key_path = "certs/client_10.147.20.114-1.key"; 
+std::string client_crt_path = "certs/client_10.147.20.114-0.crt"; 
+std::string client_key_path = "certs/client_10.147.20.114-0.key"; 
 std::string ca_crt_path = "certs/ca.crt";
 
 
@@ -69,7 +69,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("bw", po::value<double>(&bw), "analog frontend filter bandwidth in Hz")
         // display parameters
         ("num-bins", po::value<size_t>(&num_bins)->default_value(512), "the number of bins in the DFT")
-        ("frame-rate", po::value<double>(&frame_rate)->default_value(5), "frame rate of the display (fps)")
+        ("frame-rate", po::value<double>(&frame_rate)->default_value(1000), "frame rate of the display (fps)")
         ("ref-lvl", po::value<float>(&ref_lvl)->default_value(0), "reference level for the display (dB)")
         ("dyn-rng", po::value<float>(&dyn_rng)->default_value(60), "dynamic range for the display (dB)")
         ("ref", po::value<std::string>(&ref)->default_value("internal"), "reference source (internal, external, mimo)")
@@ -214,7 +214,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         if (num_rx_samps != buff.size())
             continue;
 
-        // check and update the display refresh condition
+        // // check and update the display refresh condition
         if (high_resolution_clock::now() < next_refresh) {
             continue;
         }
@@ -240,7 +240,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         data.channel_pwr[i] = average;
         i+=1;
         if(i > 14){
-            post_data(data, "https://10.147.20.114:1443/sas-api/measurements");
+            post_data(data, "https://10.147.20.60:1443/sas-api/measurements");
             i = 0;
             freq = 3555e6;   //Set to channel one center back i.e. 3.555 GHz 
             std::cout << "\n";
