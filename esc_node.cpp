@@ -19,6 +19,9 @@
 #include <thread>
 #include <sstream>
 
+
+#define FFT_ON_FPGA 1
+
 namespace po = boost::program_options;
 using std::chrono::high_resolution_clock;
 
@@ -38,13 +41,15 @@ void post_power_data(channel_data data, std::string url);
 
 void post_iq_data(std::vector<std::complex<float>> *buff, size_t len, uint8_t channel, std::string url);
 
+void compute_average_on_bins(float *dft, size_t len);
+
 void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::variables_map vm);
 
 int UHD_SAFE_MAIN(int argc, char* argv[])
 {
     // variables to be set by po
     std::string args, ant, subdev, ref;
-    size_t num_bins;
+    size_t len;
     double rate, freq, gain, bw, frame_rate, step;
     float ref_lvl, dyn_rng;
     bool show_controls;
@@ -70,7 +75,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("subdev", po::value<std::string>(&subdev), "subdevice specification")
         ("bw", po::value<double>(&bw), "analog frontend filter bandwidth in Hz")
         // display parameters
-        ("num-bins", po::value<size_t>(&num_bins)->default_value(512), "the number of bins in the DFT")
+        ("num-bins", po::value<size_t>(&len)->default_value(512), "the number of bins in the DFT")
         ("frame-rate", po::value<double>(&frame_rate)->default_value(1000), "frame rate of the display (fps)")
         ("ref-lvl", po::value<float>(&ref_lvl)->default_value(0), "reference level for the display (dB)")
         ("dyn-rng", po::value<float>(&dyn_rng)->default_value(60), "dynamic range for the display (dB)")
@@ -196,13 +201,14 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
 
     // allocate recv buffer and metatdata
     uhd::rx_metadata_t md;
-    std::vector<std::complex<float>> buff(num_bins);
+    std::vector<std::complex<float>> buff(len);
     //------------------------------------------------------------------
     //-- Initialize
     //------------------------------------------------------------------
     //initscr(); // curses init
     rx_stream->issue_stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
     auto next_refresh = high_resolution_clock::now();
+    auto data_sent_time = high_resolution_clock::now();
 
     //------------------------------------------------------------------
     //-- Main loop
@@ -228,31 +234,37 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
             esc_dft::log_pwr_dft(&buff.front(), num_rx_samps));
 
         // re-order the dft so dc in in the center
-        const size_t num_bins = lpdft.size() - 1 + lpdft.size() % 2; // make it odd
-        esc_dft::log_pwr_dft_type dft(num_bins);
-        for (size_t n = 0; n < num_bins; n++) {
-            dft[n] = lpdft[(n + num_bins / 2) % num_bins];
+        const size_t len = lpdft.size() - 1 + lpdft.size() % 2; // make it odd
+        esc_dft::log_pwr_dft_type dft(len);
+        for (size_t n = 0; n < len; n++) {
+            dft[n] = lpdft[(n + len / 2) % len];
         }
-        int64_t average = 0;
-        std::cout << " Ch = " << i+1;
-        for(int i = 0; i < dft.size(); i++){
-            average = (average + dft[i])/2;
-        }
-        std::cout << " " << average;
-        data.channel_pwr[i] = average;
-        i+=1;
-        if(i > 14){
+        // int64_t average = 0;
+        // std::cout << " Ch = " << i+1;
+        // for(int i = 0; i < dft.size(); i++){
+        //     average = (average + dft[i])/2;
+        // }
+        // std::cout << " " << average;
+        // data.channel_pwr[i] = average;
+        // i+=1;
+        // if(i > 14){
+        //     post_power_data(data, "https://10.147.20.60:1443/sas-api/measurements");
+        //     post_iq_data(&buff, len, 14, "https://10.147.20.60:1443/sas-api/samples");
+        //     i = 0;
+        //     freq = 3555e6;   //Set to channel one center back i.e. 3.555 GHz 
+        //     std::cout << "\n";
+        // }
+        // else{
+        //     freq += 10e6;    //Increment frequency by 10 MHz to observe the next channel
+        //     set_center_frequency(freq, usrp, vm);
+        // }
+        compute_average_on_bins(dft.data(), len);
+       
+        if(high_resolution_clock::now() > data_sent_time){
+            data_sent_time  = high_resolution_clock::now()
+                       + std::chrono::microseconds(int64_t(500e3));
             post_power_data(data, "https://10.147.20.60:1443/sas-api/measurements");
-            post_iq_data(&buff, num_bins, 14, "https://10.147.20.60:1443/sas-api/samples");
-            i = 0;
-            freq = 3555e6;   //Set to channel one center back i.e. 3.555 GHz 
-            std::cout << "\n";
         }
-        else{
-            freq += 10e6;    //Increment frequency by 10 MHz to observe the next channel
-            set_center_frequency(freq, usrp, vm);
-        }
-        
        
     }
 
@@ -266,6 +278,33 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     std::cout << std::endl << "Done!" << std::endl << std::endl;
 
     return EXIT_SUCCESS;
+}
+
+void compute_average_on_bins(float *dft, size_t len){
+    // Calculate number of averages we want to take
+    int num_averages = 15;
+
+    // Calculate average of first 34 elements
+    for (int i = 0; i < num_averages-1; i++) {
+        double sum = 0;
+        for (int j = i*34 + 1; j < (i+1)*34 + 1; j++) {
+            sum = sum + dft[j];
+        }
+        data.channel_pwr[i] = sum / 34.0;
+        std::cout << " Ch = " << i;
+        std::cout << " " << data.channel_pwr[i];
+    }
+
+    // Calculate average of last 34 elements, excluding the last element
+    double sum = 0;
+    for (int i = len-35; i < len-1; i++) {
+        sum += dft[i];
+    }
+    data.channel_pwr[num_averages-1] = sum / 34.0;
+    std::cout << " Ch = " << 14;
+    std::cout << " " << data.channel_pwr[num_averages-1];
+    std::cout << "\n";
+
 }
 
 //Function to set the center frequency via the UHD driver
