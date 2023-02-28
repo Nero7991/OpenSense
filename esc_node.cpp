@@ -22,8 +22,6 @@
 namespace po = boost::program_options;
 using std::chrono::high_resolution_clock;
 
-void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::variables_map vm);
-
 struct channel_data {
     int16_t channel_pwr[15];
     double lat;
@@ -36,7 +34,11 @@ std::string client_key_path = "certs/client_10.147.20.114-0.key";
 std::string ca_crt_path = "certs/ca.crt";
 
 
-void post_data(channel_data data, std::string url);
+void post_power_data(channel_data data, std::string url);
+
+void post_iq_data(std::vector<std::complex<float>> *buff, size_t len, uint8_t channel, std::string url);
+
+void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::variables_map vm);
 
 int UHD_SAFE_MAIN(int argc, char* argv[])
 {
@@ -240,7 +242,8 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         data.channel_pwr[i] = average;
         i+=1;
         if(i > 14){
-            post_data(data, "https://10.147.20.60:1443/sas-api/measurements");
+            post_power_data(data, "https://10.147.20.60:1443/sas-api/measurements");
+            post_iq_data(&buff, num_bins, 14, "https://10.147.20.60:1443/sas-api/samples");
             i = 0;
             freq = 3555e6;   //Set to channel one center back i.e. 3.555 GHz 
             std::cout << "\n";
@@ -274,8 +277,8 @@ void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::v
     //std::cout << boost::format("RX Freq: %f MHz...") % (usrp->get_rx_freq() / 1e6);
 }
 
-//Function to send HTTPS post request
-void post_data(channel_data data, std::string url) {
+//Function to send HTTPS post request for all the power values
+void post_power_data(channel_data data, std::string url) {
     // Construct the JSON payload
     std::stringstream json_ss;
     json_ss << "{";
@@ -296,4 +299,29 @@ void post_data(channel_data data, std::string url) {
 
     // Execute the curl command
     system(command.c_str());
+}
+
+//Function to send HTTPS post request for the IQ samples for further processing if a power level is above a threshold.
+ void post_iq_data(std::vector<std::complex<float>> *buff, size_t len, uint8_t channel, std::string url){
+    std::stringstream json_ss;
+    json_ss << "{";
+    json_ss << "\"sensor_id\": \"CCI-xG-Sensor-01\"," ;
+    json_ss << "\"lat\":" << data.lat << ",";
+    json_ss << "\"lon\":" << data.lon << ",";
+
+    json_ss << "\"iq_samples\":[";
+    for (int i = 0; i < len - 1; i++) {
+        json_ss << "[" << buff->at(i).real() << "," << buff->at(i).imag() << "],";
+    }
+    json_ss << "[" << buff->at(len - 1).real() << "," << buff->at(len - 1).imag() << "]";
+    json_ss << "]}";
+
+    std::string json_str = json_ss.str();
+
+    // Construct the curl command
+    std::string command = "curl -X POST -H 'Content-Type: application/json' --data '" + json_str + "' --cert " + client_crt_path + " --key " + client_key_path + " --cacert " + ca_crt_path + " " + url;
+
+    // Execute the curl command
+    system(command.c_str());
+
 }
