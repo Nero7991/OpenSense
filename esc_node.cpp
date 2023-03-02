@@ -18,6 +18,16 @@
 #include <iostream>
 #include <thread>
 #include <sstream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <cstring>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <mutex>
+
+std::mutex curl_mutex;
 
 
 #define FFT_ON_FPGA 1
@@ -26,22 +36,26 @@ namespace po = boost::program_options;
 using std::chrono::high_resolution_clock;
 
 struct channel_data {
-    int16_t channel_pwr[15];
+    float channel_pwr[15];
     double lat;
     double lon;
 };
 
 struct channel_data data;
-std::string client_crt_path = "certs/client_10.147.20.114-0.crt"; 
-std::string client_key_path = "certs/client_10.147.20.114-0.key"; 
+std::string client_crt_path = "certs/client_10.147.20.75-0.crt"; 
+std::string client_key_path = "certs/client_10.147.20.75-0.key"; 
 std::string ca_crt_path = "certs/ca.crt";
+
+std::string opensas_url = "https://10.147.20.75:1443/sas-api/";
 
 
 void post_power_data(channel_data data, std::string url);
 
-void post_iq_data(std::vector<std::complex<float>> *buff, size_t len, uint8_t channel, std::string url);
+void post_iq_data(std::vector<std::complex<float>>& buff, size_t len, uint8_t channel, std::string url);
 
-void compute_average_on_bins(float *dft, size_t len);
+void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uint8_t channel, std::string url);
+
+int compute_average_on_bins(float *dft, size_t len);
 
 void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::variables_map vm);
 
@@ -202,6 +216,8 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     // allocate recv buffer and metatdata
     uhd::rx_metadata_t md;
     std::vector<std::complex<float>> buff(len);
+    std::vector<std::complex<float>> detect_buff(1e5);
+
     //------------------------------------------------------------------
     //-- Initialize
     //------------------------------------------------------------------
@@ -221,6 +237,13 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         size_t num_rx_samps = rx_stream->recv(&buff.front(), buff.size(), md);
         if (num_rx_samps != buff.size())
             continue;
+
+        // Print the first 10 IQ samples
+        int j = 0;
+        while (j < 5) {
+            std::cout << "Sample " << j << ": " << buff[j] << std::endl;
+            j++;
+        }
 
         // // check and update the display refresh condition
         if (high_resolution_clock::now() < next_refresh) {
@@ -258,13 +281,38 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         //     freq += 10e6;    //Increment frequency by 10 MHz to observe the next channel
         //     set_center_frequency(freq, usrp, vm);
         // }
-        compute_average_on_bins(dft.data(), len);
-       
-        if(high_resolution_clock::now() > data_sent_time){
-            data_sent_time  = high_resolution_clock::now()
-                       + std::chrono::microseconds(int64_t(500e3));
-            post_power_data(data, "https://10.147.20.60:1443/sas-api/measurements");
+        // check if any channels are above the threshold
+        int detect_channel = compute_average_on_bins(dft.data(), len);
+
+        //print detect channel
+        std::cout << "Detect channel: " << detect_channel << std::endl;
+
+        if(detect_channel < 0){
+            if(high_resolution_clock::now() > data_sent_time){
+                data_sent_time  = high_resolution_clock::now()
+                        + std::chrono::microseconds(int64_t(500e3));
+                post_power_data(data, opensas_url + "measurements");
+            }
         }
+        else{
+            size_t num_rx_detect_samps = 0;
+            while (num_rx_detect_samps < detect_buff.size()) {
+                // Wait for the next buffer of samples
+                num_rx_detect_samps += rx_stream->recv(&detect_buff.front(), detect_buff.size(), md);
+                // Print the number of samples received
+                std::cout << "Received " << num_rx_detect_samps << " samples" << std::endl;
+                if (num_rx_samps != detect_buff.size())
+                    continue;
+            }
+            if(high_resolution_clock::now() > data_sent_time){
+                data_sent_time  = high_resolution_clock::now()
+                        + std::chrono::microseconds(int64_t(50e3));
+                //post_power_data(data, opensas_url + "measurements");
+                post_iq_data_nocurl(detect_buff, detect_buff.size(), detect_channel, opensas_url + "samples");
+            }
+        }
+       
+        
        
     }
 
@@ -280,10 +328,15 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     return EXIT_SUCCESS;
 }
 
-void compute_average_on_bins(float *dft, size_t len){
+/*
+Computes average on 510 excluding the 0th and 511th bin, returns -1 if no bins are above threshold,
+else returns the index of channel with power above threshold 
+*/
+int compute_average_on_bins(float *dft, size_t len){
     // Calculate number of averages we want to take
     int num_averages = 15;
-
+    int detect_channel = -1;
+    float max = -100;
     // Calculate average of first 34 elements
     for (int i = 0; i < num_averages-1; i++) {
         double sum = 0;
@@ -293,6 +346,15 @@ void compute_average_on_bins(float *dft, size_t len){
         data.channel_pwr[i] = sum / 34.0;
         std::cout << " Ch = " << i;
         std::cout << " " << data.channel_pwr[i];
+        // Check if the average is above the threshold
+        if(data.channel_pwr[i] > -60){
+            // Check if the average is greater than the max
+            if(data.channel_pwr[i] > max){
+                // Update the max and the channel
+                max = data.channel_pwr[i];
+                detect_channel = i;
+            }
+        }
     }
 
     // Calculate average of last 34 elements, excluding the last element
@@ -300,11 +362,36 @@ void compute_average_on_bins(float *dft, size_t len){
     for (int i = len-35; i < len-1; i++) {
         sum += dft[i];
     }
+    // Check if the last element is above the threshold
     data.channel_pwr[num_averages-1] = sum / 34.0;
+    if(data.channel_pwr[num_averages-1] > -60){
+        if(data.channel_pwr[num_averages-1] > max){
+            max = data.channel_pwr[num_averages-1];
+            detect_channel = num_averages-1;
+        }
+    }
     std::cout << " Ch = " << 14;
     std::cout << " " << data.channel_pwr[num_averages-1];
     std::cout << "\n";
+    return detect_channel;
+}
 
+/**
+ * Calculates the center frequency in MHz for a given channel number.
+ * 
+ * @param channel The channel number, between 0 and 14 (inclusive).
+ * @return The center frequency in MHz.
+ */
+double getCenterFreq(int channel) {
+    const double channelWidth = 10.0; // The width of each channel in MHz.
+    const double baseFreq = 3550.0e6; // The frequency of the first channel in MHz.
+    
+    // Calculate the center frequency of the specified channel using the formula:
+    // centerFreq = baseFreq + (channel * channelWidth) + (channelWidth / 2.0)
+    double centerFreq = baseFreq + (channel * channelWidth) + (channelWidth / 2.0);
+    
+    // Return the center frequency to the caller.
+    return centerFreq;
 }
 
 //Function to set the center frequency via the UHD driver
@@ -336,12 +423,24 @@ void post_power_data(channel_data data, std::string url) {
     // Construct the curl command
     std::string command = "curl -X POST -H 'Content-Type: application/json' --data '" + json_str + "' --cert " + client_crt_path + " --key " + client_key_path + " --cacert " + ca_crt_path + " " + url;
 
+    // Lock the mutex before calling system()
+    curl_mutex.lock();
+
+    // Execute the curl command
+    system(command.c_str());
+
+    // Unlock the mutex after the system() call is complete
+    curl_mutex.unlock();
+
     // Execute the curl command
     system(command.c_str());
 }
 
-//Function to send HTTPS post request for the IQ samples for further processing if a power level is above a threshold.
- void post_iq_data(std::vector<std::complex<float>> *buff, size_t len, uint8_t channel, std::string url){
+/* 
+Function to send HTTPS post request for the IQ samples for further processing if a 
+power level is above a threshold.
+*/
+ void post_iq_data(std::vector<std::complex<float>>& buff, size_t len, uint8_t channel, std::string url){
     std::stringstream json_ss;
     json_ss << "{";
     json_ss << "\"sensor_id\": \"CCI-xG-Sensor-01\"," ;
@@ -350,12 +449,18 @@ void post_power_data(channel_data data, std::string url) {
 
     json_ss << "\"iq_samples\":[";
     for (int i = 0; i < len - 1; i++) {
-        json_ss << "[" << buff->at(i).real() << "," << buff->at(i).imag() << "],";
+        json_ss << "[" << buff.at(i).real() << "," << buff.at(i).imag() << "],";
     }
-    json_ss << "[" << buff->at(len - 1).real() << "," << buff->at(len - 1).imag() << "]";
+    json_ss << "[" << buff.at(len - 1).real() << "," << buff.at(len - 1).imag() << "]";
     json_ss << "]}";
 
     std::string json_str = json_ss.str();
+
+    //Print the JSON string
+    //std::cout << json_str << std::endl;
+
+    //Nofity the user that the data is being sent
+    std::cout << "Sending 100k IQ samples to OpenSAS..." << std::endl; 
 
     // Construct the curl command
     std::string command = "curl -X POST -H 'Content-Type: application/json' --data '" + json_str + "' --cert " + client_crt_path + " --key " + client_key_path + " --cacert " + ca_crt_path + " " + url;
@@ -363,4 +468,109 @@ void post_power_data(channel_data data, std::string url) {
     // Execute the curl command
     system(command.c_str());
 
+    std::cout << command.c_str() << std::endl;
+
+    //Nofity the user that the data has been sent
+    std::cout << "Data sent." << std::endl;
+}
+
+/* 
+
+ */
+void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uint8_t channel, std::string url) {
+    std::stringstream json_ss;
+    json_ss << "{";
+    json_ss << "\"sensor_id\": \"CCI-xG-Sensor-01\"," ;
+    json_ss << "\"lat\":" << data.lat << ",";
+    json_ss << "\"lon\":" << data.lon << ",";
+    json_ss << "\"iq_samples\":[";
+    for (int i = 0; i < 1000; i++) {
+        json_ss << "[" << buff.at(i).real() << "," << buff.at(i).imag() << "],";
+    }
+    json_ss << "[" << buff.at(len - 1).real() << "," << buff.at(len - 1).imag() << "]";
+    json_ss << "]}";
+
+    std::string json_str = json_ss.str();
+
+    //Nofity the user that the data is being sent
+    std::cout << "Sending data to server..." << std::endl; 
+
+    // Initialize OpenSSL
+    SSL_library_init();
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
+
+    // Load the client certificate and key
+    if (SSL_CTX_use_certificate_file(ssl_ctx, client_crt_path.c_str(), SSL_FILETYPE_PEM) <= 0) {
+        perror("ERROR loading client certificate");
+        return;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, client_key_path.c_str(), SSL_FILETYPE_PEM) <= 0) {
+        perror("ERROR loading client private key");
+        return;
+    }
+
+    // Load the CA certificate
+    if (SSL_CTX_load_verify_locations(ssl_ctx, ca_crt_path.c_str(), nullptr) <= 0) {
+        perror("ERROR loading CA certificate");
+        return;
+    }
+
+    // Create a socket
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("ERROR opening socket");
+        return;
+    }
+
+    // Set the server address
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(1443);
+    if (inet_pton(AF_INET, "10.147.20.75", &serv_addr.sin_addr) <= 0) {
+        perror("ERROR invalid address");
+        return;
+    }
+
+    // Connect to the server
+    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        perror("ERROR connecting");
+        return;
+    }
+
+    // Create an SSL object and attach it to the socket
+    SSL *ssl = SSL_new(ssl_ctx);
+    SSL_set_fd(ssl, sockfd);
+
+    // Establish the SSL connection
+    if (SSL_connect(ssl) != 1) {
+        perror("ERROR establishing SSL connection");
+        return;
+    }
+
+    // Send the HTTP POST request
+    std::string post_req = "POST /sas-api/samples HTTP/1.1\r\n";
+    post_req += "Host: " + url + "\r\n";
+    post_req += "Content-Type: application/json\r\n";
+    post_req += "Content-Length: " + std::to_string(json_str.size()) + "\r\n";
+    post_req += "\r\n";
+    post_req += json_str;
+    if (SSL_write(ssl, post_req.c_str(), post_req.size()) < 0) {
+        perror("ERROR writing to socket");
+        return;
+    }
+
+    // Read the response from the server
+    char buffer[1024];
+    int bytes_read = SSL_read(ssl, buffer, sizeof(buffer));
+    if (bytes_read < 0) {
+        perror("ERROR reading from socket");
+        return;
+    }
+
+    // Close the SSL connection and the socket
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ssl_ctx);
+    close(sockfd);
 }
