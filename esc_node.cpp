@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
+//Modified by Oren Rodney Collaco
+
 #include "esc_dft.hpp" //implementation
 #include <uhd/usrp/multi_usrp.hpp>
 #include <uhd/utils/safe_main.hpp>
@@ -32,6 +34,11 @@ std::mutex curl_mutex;
 
 #define FFT_ON_FPGA 1
 
+#define DEBUG 0
+
+#define DETECTION_SAMPLE_SIZE 102400
+#define DETECTION_THRESHOLD   -70
+
 namespace po = boost::program_options;
 using std::chrono::high_resolution_clock;
 
@@ -55,12 +62,20 @@ void post_iq_data(std::vector<std::complex<float>>& buff, size_t len, uint8_t ch
 
 void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uint8_t channel, std::string url);
 
+void post_json(std::string json_str, std::string url);
+
 int compute_average_on_bins(float *dft, size_t len);
 
 void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::variables_map vm);
 
+double get_center_freq(int channel);
+
 int UHD_SAFE_MAIN(int argc, char* argv[])
 {
+    //init channel power data
+    for (int i = 0; i < 15; i++) {
+        data.channel_pwr[i] = -100;
+    }
     // variables to be set by po
     std::string args, ant, subdev, ref;
     size_t len;
@@ -78,6 +93,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     // setup the program options
     po::options_description desc("Allowed options");
     // clang-format off
+
     desc.add_options()
         ("help", "help message")
         ("args", po::value<std::string>(&args)->default_value(""), "multi uhd device address args")
@@ -216,15 +232,28 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     // allocate recv buffer and metatdata
     uhd::rx_metadata_t md;
     std::vector<std::complex<float>> buff(len);
-    std::vector<std::complex<float>> detect_buff(1e5);
+    std::vector<std::complex<float>> detect_buff(DETECTION_SAMPLE_SIZE);
 
     //------------------------------------------------------------------
     //-- Initialize
     //------------------------------------------------------------------
     //initscr(); // curses init
-    rx_stream->issue_stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
+
+    //Create issue stream command asking for buf samples
+    uhd::stream_cmd_t stream_cmd_normal(uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_MORE);
+    stream_cmd_normal.num_samps = size_t(buff.size());
+    stream_cmd_normal.stream_now = true;
+    stream_cmd_normal.time_spec  = uhd::time_spec_t();
+
+    //Create issue stream command asking for buf samples
+    uhd::stream_cmd_t stream_cmd_detect(uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_MORE);
+    stream_cmd_detect.num_samps = size_t(detect_buff.size());
+    stream_cmd_detect.stream_now = true;
+    stream_cmd_detect.time_spec  = uhd::time_spec_t();
+
     auto next_refresh = high_resolution_clock::now();
     auto data_sent_time = high_resolution_clock::now();
+    auto iq_data_sent_time = high_resolution_clock::now();
 
     //------------------------------------------------------------------
     //-- Main loop
@@ -232,18 +261,26 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     
     int i = 0;
     bool new_data_available = false;
+
+
+    
     while (true) {
+        //Tell USRP to only stream x amount of samples until asked again.
+        rx_stream->issue_stream_cmd(stream_cmd_normal);
+
         // read a buffer's worth of samples every iteration
         size_t num_rx_samps = rx_stream->recv(&buff.front(), buff.size(), md);
         if (num_rx_samps != buff.size())
             continue;
 
+        #if DEBUG
         // Print the first 10 IQ samples
         int j = 0;
         while (j < 5) {
             std::cout << "Sample " << j << ": " << buff[j] << std::endl;
             j++;
         }
+        #endif
 
         // // check and update the display refresh condition
         if (high_resolution_clock::now() < next_refresh) {
@@ -282,38 +319,59 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         //     set_center_frequency(freq, usrp, vm);
         // }
         // check if any channels are above the threshold
+
         int detect_channel = compute_average_on_bins(dft.data(), len);
 
+        #if DEBUG
         //print detect channel
         std::cout << "Detect channel: " << detect_channel << std::endl;
+        #endif
 
         if(detect_channel < 0){
             if(high_resolution_clock::now() > data_sent_time){
                 data_sent_time  = high_resolution_clock::now()
-                        + std::chrono::microseconds(int64_t(500e3));
+                        + std::chrono::microseconds(int64_t(250e3));
+                #if DEBUG
+                //Now send the data to the server
+                printf("Sending power meas");
+                #endif
                 post_power_data(data, opensas_url + "measurements");
             }
         }
         else{
-            size_t num_rx_detect_samps = 0;
-            while (num_rx_detect_samps < detect_buff.size()) {
-                // Wait for the next buffer of samples
-                num_rx_detect_samps += rx_stream->recv(&detect_buff.front(), detect_buff.size(), md);
-                // Print the number of samples received
-                std::cout << "Received " << num_rx_detect_samps << " samples" << std::endl;
-                if (num_rx_samps != detect_buff.size())
-                    continue;
-            }
-            if(high_resolution_clock::now() > data_sent_time){
-                data_sent_time  = high_resolution_clock::now()
-                        + std::chrono::microseconds(int64_t(50e3));
-                //post_power_data(data, opensas_url + "measurements");
+            if(high_resolution_clock::now() > iq_data_sent_time){
+                size_t num_rx_detect_samps = 0;
+                //Change center frequency to the detected channel
+                set_center_frequency(get_center_freq(detect_channel), usrp, vm);
+                //Change sample rate to 10.24 MHz to capture 1 ms of data for the detected channel
+                std::cout << boost::format("Setting RX Rate: %f Msps...") % (10.24e6 / 1e6) << std::endl;
+                usrp->set_rx_rate(10.24e6);
+                std::cout << boost::format("Actual RX Rate: %f Msps...") % (usrp->get_rx_rate() / 1e6)
+                        << std::endl
+                        << std::endl;
+                rx_stream->issue_stream_cmd(stream_cmd_detect);
+                while (num_rx_detect_samps < detect_buff.size()) {
+                    // Wait for the next buffer of samples
+                    num_rx_detect_samps += rx_stream->recv(&detect_buff.front(), detect_buff.size(), md);
+                    // Print the number of samples received
+                    std::cout << "Received " << num_rx_detect_samps << " samples" << std::endl;
+                    if (num_rx_samps != detect_buff.size())
+                        continue;
+                }
+                
+                post_power_data(data, opensas_url + "measurements");
                 post_iq_data_nocurl(detect_buff, detect_buff.size(), detect_channel, opensas_url + "samples");
+                //Change sample rate back to 122.88 MHz
+                std::cout << boost::format("Setting RX Rate: %f Msps...") % (122.88e6 / 1e6) << std::endl;
+                usrp->set_rx_rate(122.88e6);
+                std::cout << boost::format("Actual RX Rate: %f Msps...") % (usrp->get_rx_rate() / 1e6)
+                        << std::endl
+                        << std::endl;
+                iq_data_sent_time  = high_resolution_clock::now()
+                        + std::chrono::microseconds(int64_t(50e3));
+                set_center_frequency(3650e6, usrp, vm);
             }
         }
-       
-        
-       
     }
 
     //------------------------------------------------------------------
@@ -335,19 +393,26 @@ else returns the index of channel with power above threshold
 int compute_average_on_bins(float *dft, size_t len){
     // Calculate number of averages we want to take
     int num_averages = 15;
+    int channel_offset = 5;
+    int start_point = 10;
+    int end_point_offset = 10;
     int detect_channel = -1;
     float max = -100;
     // Calculate average of first 34 elements
-    for (int i = 0; i < num_averages-1; i++) {
+    int step = 41;
+
+    for (int i = channel_offset; i < num_averages-1; i++) {
         double sum = 0;
-        for (int j = i*34 + 1; j < (i+1)*34 + 1; j++) {
+        for (int j = (i - channel_offset)  * step + start_point; j < (i + 1 - channel_offset) * step + start_point; j++) {
             sum = sum + dft[j];
         }
-        data.channel_pwr[i] = sum / 34.0;
+        data.channel_pwr[i] = sum / step;
+        #if DEBUG
         std::cout << " Ch = " << i;
         std::cout << " " << data.channel_pwr[i];
+        #endif
         // Check if the average is above the threshold
-        if(data.channel_pwr[i] > -60){
+        if(data.channel_pwr[i] > DETECTION_THRESHOLD){
             // Check if the average is greater than the max
             if(data.channel_pwr[i] > max){
                 // Update the max and the channel
@@ -359,20 +424,22 @@ int compute_average_on_bins(float *dft, size_t len){
 
     // Calculate average of last 34 elements, excluding the last element
     double sum = 0;
-    for (int i = len-35; i < len-1; i++) {
+    for (int i = len-step-end_point_offset; i < len-end_point_offset; i++) {
         sum += dft[i];
     }
     // Check if the last element is above the threshold
-    data.channel_pwr[num_averages-1] = sum / 34.0;
+    data.channel_pwr[num_averages-1] = sum / step;
     if(data.channel_pwr[num_averages-1] > -60){
         if(data.channel_pwr[num_averages-1] > max){
             max = data.channel_pwr[num_averages-1];
             detect_channel = num_averages-1;
         }
     }
+    #if DEBUG
     std::cout << " Ch = " << 14;
     std::cout << " " << data.channel_pwr[num_averages-1];
     std::cout << "\n";
+    #endif
     return detect_channel;
 }
 
@@ -382,8 +449,8 @@ int compute_average_on_bins(float *dft, size_t len){
  * @param channel The channel number, between 0 and 14 (inclusive).
  * @return The center frequency in MHz.
  */
-double getCenterFreq(int channel) {
-    const double channelWidth = 10.0; // The width of each channel in MHz.
+double get_center_freq(int channel) {
+    const double channelWidth = 10.0e6; // The width of each channel in MHz.
     const double baseFreq = 3550.0e6; // The frequency of the first channel in MHz.
     
     // Calculate the center frequency of the specified channel using the formula:
@@ -400,7 +467,7 @@ void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::v
     if (vm.count("int-n"))
         tune_request.args = uhd::device_addr_t("mode_n=integer");
     usrp->set_rx_freq(tune_request);
-    //std::cout << boost::format("RX Freq: %f MHz...") % (usrp->get_rx_freq() / 1e6);
+    std::cout << boost::format("RX Freq: %f MHz...\n") % (usrp->get_rx_freq() / 1e6);
 }
 
 //Function to send HTTPS post request for all the power values
@@ -423,17 +490,7 @@ void post_power_data(channel_data data, std::string url) {
     // Construct the curl command
     std::string command = "curl -X POST -H 'Content-Type: application/json' --data '" + json_str + "' --cert " + client_crt_path + " --key " + client_key_path + " --cacert " + ca_crt_path + " " + url;
 
-    // Lock the mutex before calling system()
-    curl_mutex.lock();
-
-    // Execute the curl command
-    system(command.c_str());
-
-    // Unlock the mutex after the system() call is complete
-    curl_mutex.unlock();
-
-    // Execute the curl command
-    system(command.c_str());
+    post_json(json_str, url);
 }
 
 /* 
@@ -446,7 +503,7 @@ power level is above a threshold.
     json_ss << "\"sensor_id\": \"CCI-xG-Sensor-01\"," ;
     json_ss << "\"lat\":" << data.lat << ",";
     json_ss << "\"lon\":" << data.lon << ",";
-
+    json_ss << "\"detected_channel\":" << channel << ",";
     json_ss << "\"iq_samples\":[";
     for (int i = 0; i < len - 1; i++) {
         json_ss << "[" << buff.at(i).real() << "," << buff.at(i).imag() << "],";
@@ -484,7 +541,7 @@ void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uin
     json_ss << "\"lat\":" << data.lat << ",";
     json_ss << "\"lon\":" << data.lon << ",";
     json_ss << "\"iq_samples\":[";
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < len - 1; i++) {
         json_ss << "[" << buff.at(i).real() << "," << buff.at(i).imag() << "],";
     }
     json_ss << "[" << buff.at(len - 1).real() << "," << buff.at(len - 1).imag() << "]";
@@ -492,9 +549,40 @@ void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uin
 
     std::string json_str = json_ss.str();
 
+    #if DEBUG
     //Nofity the user that the data is being sent
     std::cout << "Sending data to server..." << std::endl; 
+    #endif
 
+    post_json(json_str, url);
+}
+
+void post_json(std::string json_str, std::string url) {
+
+    char url_new[url.length() + 1];
+    strcpy(url_new, url.c_str());
+
+    // Find the protocol component
+    char *protocol = strtok(url_new, ":/");
+
+    // Find the hostname component
+    char *hostname = strtok(NULL, ":/");
+
+    // Find the port component
+    char *port = strtok(NULL, "/");
+
+    // Find the path component
+    char *path = strtok(NULL, "");
+    std::string path_str(path);
+
+    #if DEBUG
+    // Print the components
+    std::cout << "Protocol: " << protocol << std::endl;
+    std::cout << "Hostname: " << hostname << std::endl;
+    std::cout << "Port: " << port << std::endl;
+    std::cout << "Path: " << path_str << std::endl;
+    #endif
+    
     // Initialize OpenSSL
     SSL_library_init();
     SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
@@ -526,8 +614,8 @@ void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uin
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(1443);
-    if (inet_pton(AF_INET, "10.147.20.75", &serv_addr.sin_addr) <= 0) {
+    serv_addr.sin_port = htons(atoi(port));
+    if (inet_pton(AF_INET, hostname, &serv_addr.sin_addr) <= 0) {
         perror("ERROR invalid address");
         return;
     }
@@ -549,7 +637,7 @@ void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uin
     }
 
     // Send the HTTP POST request
-    std::string post_req = "POST /sas-api/samples HTTP/1.1\r\n";
+    std::string post_req = "POST /" + path_str + " HTTP/1.1\r\n";
     post_req += "Host: " + url + "\r\n";
     post_req += "Content-Type: application/json\r\n";
     post_req += "Content-Length: " + std::to_string(json_str.size()) + "\r\n";

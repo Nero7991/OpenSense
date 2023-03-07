@@ -33,6 +33,7 @@ find_package(UHD 3.15.0 REQUIRED)
 #find_package(UHD 4.0.0 EXACT REQUIRED)
 
 find_package(Curses REQUIRED)
+find_package(OpenSSL REQUIRED)
 include_directories(${CURSES_INCLUDE_DIR})
 
 # This example also requires Boost.
@@ -55,7 +56,7 @@ link_directories(${Boost_LIBRARY_DIRS})
 ### Make the executable #######################################################
 add_executable(esc_node esc_node.cpp)
 
-target_link_libraries(esc_node ${CURSES_LIBRARIES})
+target_link_libraries(esc_node ${CURSES_LIBRARIES} OpenSSL::SSL OpenSSL::Crypto)
 
 set(CMAKE_BUILD_TYPE "Release")
 message(STATUS "******************************************************************************")
