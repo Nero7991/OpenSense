@@ -36,15 +36,15 @@ std::string ca_crt_path = "../certs/ca.crt";
 
 std::string opensas_url = "https://10.147.20.75:1443/sas-api/";
 
-#define FFT_ON_FPGA 1
+#define FFT_ON_FPGA 0
 
 // #define DEBUG 1
 #define DEBUG 0
 
-#define STATS 1
+#define STATS 0
 // #define STATS 0
 
-#define STATS_FFT 0
+#define STATS_FFT 1
 // #define STATS_FFT 0
 
 // based on the input shape the model will be trained to detect
@@ -267,8 +267,11 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     auto iq_data_sent_time = high_resolution_clock::now();
 #if STATS
     auto detection_stats_time = high_resolution_clock::now();
+#endif
+#if STATS_FFT
     auto fft_stats_time = high_resolution_clock::now();
 #endif
+
     //------------------------------------------------------------------
     //-- Main loop
     //------------------------------------------------------------------
@@ -277,12 +280,12 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     bool new_data_available = false;
 
     //Wait 20 us before starting to stream
-    while (high_resolution_clock::now() < detection_stats_time + std::chrono::microseconds(20)) {
+    while (high_resolution_clock::now() < next_refresh + std::chrono::microseconds(20)) {
         continue;
     }
     //Verify the waiting time was correct
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(high_resolution_clock::now() - detection_stats_time).count();
-    printf("Waiting Time: %ld microseconds\n", duration);
+    auto duration = high_resolution_clock::now() - next_refresh;
+    std::cout << "Verifying timing (20us): " << duration.count() / 1000 << " us" << std::endl;
     
     while (true) {
         //Tell USRP to only stream x amount of samples until asked again.
@@ -309,7 +312,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         next_refresh = high_resolution_clock::now()
                        + std::chrono::microseconds(int64_t(1e6 / frame_rate));
 
-        #if STATS
+        #if STATS_FFT
         fft_stats_time = high_resolution_clock::now();
         #endif
         // calculate the dft
@@ -324,7 +327,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         }
         #if STATS_FFT
         auto fft_stats_duration = (high_resolution_clock::now() - fft_stats_time);
-        printf("FFT Stats Time: %ld microseconds\n", std::chrono::duration_cast<std::chrono::microseconds>(fft_stats_duration).count());
+        std::cout << "FFT time: "  << fft_stats_duration.count() / 1000 << " us" << std::endl;
         #endif
         // int64_t average = 0;
         // std::cout << " Ch = " << i+1;
@@ -376,7 +379,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 set_center_frequency(get_center_freq(detect_channel), usrp, vm);
                 #if STATS
                 auto detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
-                printf("Freq change duration: %ld microseconds\n", std::chrono::duration_cast<std::chrono::microseconds>(detection_stats_duration).count());
+                std::cout << "Freq shift time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
                 #endif
                 //Change sample rate to 10.24 MHz to capture 1 ms of data for the detected channel
                 
@@ -387,7 +390,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 usrp->set_rx_rate(10.24e6);
                 #if STATS
                 detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
-                printf("Srate change duration: %ld microseconds\n", std::chrono::duration_cast<std::chrono::microseconds>(detection_stats_duration).count());
+                std::cout << "Srate change time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
                 #endif
                 std::cout << boost::format("Actual RX Rate: %f Msps...") % (usrp->get_rx_rate() / 1e6)
                         << std::endl
@@ -406,7 +409,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 }
                 #if STATS
                 detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
-                printf("Sample receive duration: %ld microseconds\n", std::chrono::duration_cast<std::chrono::microseconds>(detection_stats_duration).count());
+                std::cout << "Samples recv time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
                 #endif
                 
                 post_power_data(data, opensas_url + "measurements");
@@ -416,7 +419,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 post_iq_data_nocurl(detect_buff, detect_buff.size(), detect_channel, opensas_url + "samples");
                 #if STATS
                 detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
-                printf("HTTPS request duration: %ld microseconds\n", std::chrono::duration_cast<std::chrono::microseconds>(detection_stats_duration).count());
+                std::cout << "Https req time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
                 #endif
                 //Change sample rate back to 122.88 MHz
                 std::cout << boost::format("Setting RX Rate: %f Msps...") % (122.88e6 / 1e6) << std::endl;
@@ -432,7 +435,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 set_center_frequency(3650e6, usrp, vm);
                 #if STATS
                 detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
-                printf("freq change back duration: %ld microseconds\n", std::chrono::duration_cast<std::chrono::microseconds>(detection_stats_duration).count());
+                std::cout << "Freq return time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
                 #endif
             }
         }
