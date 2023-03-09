@@ -41,10 +41,10 @@ std::string opensas_url = "https://10.147.20.75:1443/sas-api/";
 // #define DEBUG 1
 #define DEBUG 0
 
-#define STATS 0
+#define STATS 1
 // #define STATS 0
 
-#define STATS_FFT 1
+#define STATS_FFT 0
 // #define STATS_FFT 0
 
 // based on the input shape the model will be trained to detect
@@ -567,9 +567,10 @@ power level is above a threshold.
  void post_iq_data(std::vector<std::complex<float>>& buff, size_t len, uint8_t channel, std::string url){
     std::stringstream json_ss;
     json_ss << "{";
-    json_ss << "\"sensor_id\": \"CCI-xG-Sensor-01\"," ;
-    json_ss << "\"lat\":" << data.lat << ",";
-    json_ss << "\"lon\":" << data.lon << ",";
+    json_ss << "\"sensor_info\": {";
+    json_ss << "\"sensor_id\": \"" << sensor_id << "\"," ;
+    json_ss << "\"lat\":" << lat << ",";
+    json_ss << "\"lon\":" << lon << "},";
     json_ss << "\"detected_channel\":" << channel << ",";
     json_ss << "\"iq_samples\":[";
     for (int i = 0; i < len - 1; i++) {
@@ -604,9 +605,11 @@ power level is above a threshold.
 void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uint8_t channel, std::string url) {
     std::stringstream json_ss;
     json_ss << "{";
-    json_ss << "\"sensor_id\": \"CCI-xG-Sensor-01\"," ;
-    json_ss << "\"lat\":" << data.lat << ",";
-    json_ss << "\"lon\":" << data.lon << ",";
+    json_ss << "\"sensor_info\": {";
+    json_ss << "\"sensor_id\": \"" << sensor_id << "\"," ;
+    json_ss << "\"lat\":" << lat << ",";
+    json_ss << "\"lon\":" << lon << "},";
+    json_ss << "\"detected_channel\":" << channel << ",";
     json_ss << "\"iq_samples\":[";
     for (int i = 0; i < len - 1; i++) {
         json_ss << "[" << buff.at(i).real() << "," << buff.at(i).imag() << "],";
