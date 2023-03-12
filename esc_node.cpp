@@ -29,6 +29,8 @@
 #include <openssl/err.h>
 #include <mutex>
 
+#define SENSOR_NODE 1
+
 // Paths to the certificates,keys and the url of the OpenSAS server
 std::string client_crt_path = "../certs/client_10.147.20.75-0.crt"; 
 std::string client_key_path = "../certs/client_10.147.20.75-0.key"; 
@@ -52,6 +54,28 @@ std::string opensas_url = "https://10.147.20.75:1443/sas-api/";
 
 // the threshold for the detection
 #define DETECTION_THRESHOLD   -70
+
+#if SENSOR_NODE == 1
+#define SENSOR_ID "xG-OpenSense-Node1"
+#define SENSOR_LAT 38.88089743634038
+#define SENSOR_LON -77.11569278866236
+
+#elif SENSOR_NODE == 2
+#define SENSOR_ID "xG-OpenSense-Node2"
+#define SENSOR_LAT 38.880863506784166 
+#define SENSOR_LON -77.11578465431765
+
+#elif SENSOR_NODE == 3
+#define SENSOR_ID "xG-OpenSense-Node3"
+#define SENSOR_LAT 38.88099087303452 
+#define SENSOR_LON -77.11574442118396
+
+#elif SENSOR_NODE == 4
+#define SENSOR_ID "xG-OpenSense-Node4"
+#define SENSOR_LAT 38.88091988203791
+#define SENSOR_LON 77.11583494573478
+#endif
+
 
 namespace po = boost::program_options;
 using std::chrono::high_resolution_clock;
@@ -83,6 +107,10 @@ double get_center_freq(int channel);
 
 int UHD_SAFE_MAIN(int argc, char* argv[])
 {
+    //initialize channel power data
+    data.lat = SENSOR_LAT;
+    data.lon = SENSOR_LON;
+
     //init channel power data
     for (int i = 0; i < 15; i++) {
         data.channel_pwr[i] = -100;
@@ -94,13 +122,11 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     float ref_lvl, dyn_rng;
     bool show_controls;
 
-    //initialize required variables
-    rate = 10416667;       //125e6/12
-    freq = 3555000000;       //3.555 GHz
-    gain = 80;
+    // //initialize required variables
+    // rate = 10416667;       //125e6/12
+    // freq = 3555000000;       //3.555 GHz
+    // gain = 80;
 
-    data.lat = 38.88095833926984;
-    data.lon = -77.11573962785668;
     // setup the program options
     po::options_description desc("Allowed options");
     // clang-format off
@@ -461,6 +487,7 @@ int compute_average_on_bins(float *dft, size_t len){
     // Calculate number of averages we want to take
     int num_averages = 15;
     int channel_offset = 5;
+    int skip_steps = 1;
     int start_point = 10;
     int end_point_offset = 10;
     int detect_channel = -1;
@@ -470,7 +497,7 @@ int compute_average_on_bins(float *dft, size_t len){
 
     for (int i = channel_offset; i < num_averages-1; i++) {
         double sum = 0;
-        for (int j = (i - channel_offset)  * step + start_point; j < (i + 1 - channel_offset) * step + start_point; j++) {
+        for (int j = ((i - channel_offset + skip_steps)  * step) + start_point; j < (i + 1 - channel_offset + skip_steps) * step + start_point; j++) {
             sum = sum + dft[j];
         }
         data.channel_pwr[i] = sum / step;
@@ -491,7 +518,7 @@ int compute_average_on_bins(float *dft, size_t len){
 
     // Calculate average of last 34 elements, excluding the last element
     double sum = 0;
-    for (int i = len-step-end_point_offset; i < len-end_point_offset; i++) {
+    for (int i = len-(step * (skip_steps+1))-end_point_offset; i < len-(step * (skip_steps)) - end_point_offset; i++) {
         sum += dft[i];
     }
     // Check if the last element is above the threshold
@@ -534,7 +561,7 @@ void set_center_frequency(uint32_t freq, uhd::usrp::multi_usrp::sptr usrp, po::v
     if (vm.count("int-n"))
         tune_request.args = uhd::device_addr_t("mode_n=integer");
     usrp->set_rx_freq(tune_request);
-    //std::cout << boost::format("RX Freq: %f MHz...\n") % (usrp->get_rx_freq() / 1e6);
+    std::cout << boost::format("RX Freq: %f MHz...\n") % (usrp->get_rx_freq() / 1e6);
 }
 
 //Function to send HTTPS post request for all the power values
@@ -542,7 +569,7 @@ void post_power_data(channel_data data, std::string url) {
     // Construct the JSON payload
     std::stringstream json_ss;
     json_ss << "{";
-    json_ss << "\"sensor_id\": \"CCI-xG-Sensor-01\"," ;
+    json_ss << "\"sensor_id\":\"" << SENSOR_ID << "\"," ;
     json_ss << "\"lat\":" << data.lat << ",";
     json_ss << "\"lon\":" << data.lon << ",";
     json_ss << "\"channels\":[";
@@ -568,10 +595,10 @@ power level is above a threshold.
     std::stringstream json_ss;
     json_ss << "{";
     json_ss << "\"sensor_info\": {";
-    json_ss << "\"sensor_id\": \"" << sensor_id << "\"," ;
-    json_ss << "\"lat\":" << lat << ",";
-    json_ss << "\"lon\":" << lon << "},";
-    json_ss << "\"detected_channel\":" << channel << ",";
+    json_ss << "\"sensor_id\":\"" << SENSOR_ID << "\"," ;
+    json_ss << "\"lat\":" << data.lat << ",";
+    json_ss << "\"lon\":" << data.lon << "},";
+    json_ss << "\"detected_channel\":" << (int)channel << ",";
     json_ss << "\"iq_samples\":[";
     for (int i = 0; i < len - 1; i++) {
         json_ss << "[" << buff.at(i).real() << "," << buff.at(i).imag() << "],";
@@ -606,10 +633,10 @@ void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uin
     std::stringstream json_ss;
     json_ss << "{";
     json_ss << "\"sensor_info\": {";
-    json_ss << "\"sensor_id\": \"" << sensor_id << "\"," ;
-    json_ss << "\"lat\":" << lat << ",";
-    json_ss << "\"lon\":" << lon << "},";
-    json_ss << "\"detected_channel\":" << channel << ",";
+    json_ss << "\"sensor_id\":\"" << SENSOR_ID << "\"," ;
+    json_ss << "\"lat\":" << data.lat << ",";
+    json_ss << "\"lon\":" << data.lon << "},";
+    json_ss << "\"detected_channel\":" << (int)channel << ",";
     json_ss << "\"iq_samples\":[";
     for (int i = 0; i < len - 1; i++) {
         json_ss << "[" << buff.at(i).real() << "," << buff.at(i).imag() << "],";
@@ -623,6 +650,9 @@ void post_iq_data_nocurl(std::vector<std::complex<float>>& buff, size_t len, uin
     //Nofity the user that the data is being sent
     std::cout << "Sending data to server..." << std::endl; 
     #endif
+
+    //Print the JSON string
+    // std::cout << json_str << std::endl;
 
     post_json(json_str, url);
 }
