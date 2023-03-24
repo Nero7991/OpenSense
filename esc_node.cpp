@@ -30,6 +30,7 @@
 #include <mutex>
 
 #define SENSOR_NODE 1
+#define FFT_AVERAGES 2
 
 // Paths to the certificates,keys and the url of the OpenSAS server
 std::string client_crt_path = "../certs/client_10.147.20.75-0.crt"; 
@@ -88,6 +89,7 @@ struct channel_data {
 };
 
 struct channel_data data;
+size_t num_avgs = FFT_AVERAGES;
 
 std::mutex curl_mutex;
 
@@ -120,7 +122,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     size_t len;
     double rate, freq, gain, bw, frame_rate, step;
     float ref_lvl, dyn_rng;
-    bool show_controls;
+    bool show_controls, observe;
 
     // //initialize required variables
     // rate = 10416667;       //125e6/12
@@ -141,15 +143,10 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("ant", po::value<std::string>(&ant), "antenna selection")
         ("subdev", po::value<std::string>(&subdev), "subdevice specification")
         ("bw", po::value<double>(&bw), "analog frontend filter bandwidth in Hz")
+        ("observe", po::value<bool>(&observe)->default_value(false), "Keeps observing on detected channel for 10 seconds")
         // display parameters
         ("num-bins", po::value<size_t>(&len)->default_value(512), "the number of bins in the DFT")
-        ("frame-rate", po::value<double>(&frame_rate)->default_value(1000), "frame rate of the display (fps)")
-        ("ref-lvl", po::value<float>(&ref_lvl)->default_value(0), "reference level for the display (dB)")
-        ("dyn-rng", po::value<float>(&dyn_rng)->default_value(60), "dynamic range for the display (dB)")
-        ("ref", po::value<std::string>(&ref)->default_value("internal"), "reference source (internal, external, mimo)")
-        ("step", po::value<double>(&step)->default_value(1e6), "tuning step for rate/bw/freq")
-        ("show-controls", po::value<bool>(&show_controls)->default_value(true), "show the keyboard controls")
-        ("int-n", "tune USRP with integer-N tuning")
+        ("num-avgs", po::value<size_t>(&num_avgs)->default_value(FFT_AVERAGES), "the number of averages in the DFT")
     ;
     // clang-format on
     po::variables_map vm;
@@ -291,6 +288,8 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     auto next_refresh = high_resolution_clock::now();
     auto data_sent_time = high_resolution_clock::now();
     auto iq_data_sent_time = high_resolution_clock::now();
+    auto observe_time = high_resolution_clock::now();
+
 #if STATS
     auto detection_stats_time = high_resolution_clock::now();
 #endif
@@ -395,8 +394,11 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
             }
         }
         else{
-            
+            auto detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
+           
+            //while observe time is not reached, keep looking for signals
             if(high_resolution_clock::now() > iq_data_sent_time){
+                
                 size_t num_rx_detect_samps = 0;
                 //Change center frequency to the detected channel
                 #if STATS
@@ -404,8 +406,8 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 #endif
                 set_center_frequency(get_center_freq(detect_channel), usrp, vm);
                 #if STATS
-                auto detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
-                std::cout << "Freq shift time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
+                detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
+                std::cout << "Freq shift time ch" << detect_channel << ": "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
                 #endif
                 //Change sample rate to 10.24 MHz to capture 1 ms of data for the detected channel
                 
@@ -421,39 +423,64 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 std::cout << boost::format("Actual RX Rate: %f Msps...") % (usrp->get_rx_rate() / 1e6)
                         << std::endl
                         << std::endl;
-                #if STATS
-                detection_stats_time = high_resolution_clock::now();
-                #endif
-                rx_stream->issue_stream_cmd(stream_cmd_detect);
-                while (num_rx_detect_samps < detect_buff.size()) {
-                    // Wait for the next buffer of samples
-                    num_rx_detect_samps += rx_stream->recv(&detect_buff.front(), detect_buff.size(), md);
-                    // Print the number of samples received
-                    std::cout << "Received " << num_rx_detect_samps << " samples" << std::endl;
-                    if (num_rx_samps != detect_buff.size())
-                        continue;
+                 // Set observe time to 100 ms ahead of current time
+                observe_time = high_resolution_clock::now();
+                auto observe_duration = (high_resolution_clock::now() - observe_time);
+                while((observe_duration.count() /1000) < 1000e3){
+                    #if STATS
+                    detection_stats_time = high_resolution_clock::now();
+                    #endif
+                    num_rx_detect_samps = 0;
+                    rx_stream->issue_stream_cmd(stream_cmd_detect);
+                    while (num_rx_detect_samps < detect_buff.size()) {
+                        // Wait for the next buffer of samples
+                        num_rx_detect_samps += rx_stream->recv(&detect_buff.front(), detect_buff.size(), md);
+                        // Print the number of samples received
+                        std::cout << "Received " << num_rx_detect_samps << " samples" << std::endl;
+                        if (num_rx_samps != detect_buff.size())
+                            continue;
+                    }
+                    #if STATS
+                    detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
+                    std::cout << "Samples recv time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
+                    #endif
+                    //Calculate FFT on 512 samples in detect_buff
+                    // calculate the dft
+                    // esc_dft::log_pwr_dft_type detect_dft(
+                    //     esc_dft::log_pwr_dft(&detect_buff.front(), 512));
+                    post_power_data(data, opensas_url + "measurements");
+
+                    //Check if the average of all bins is above the threshold
+                    //Compute average on all bins without using compute_average_on_bins function
+                    // int64_t average = 0;
+                    // for(int i = 0; i < detect_dft.size(); i++){
+                    //     average = (average + detect_dft[i])/2;
+                    // }
+                    // std::cout << "Detected average: " << average << std::endl;
+                    //If average is above threshold, send the data to the server
+                    // if(average > DETECTION_THRESHOLD){
+                        #if STATS
+                        detection_stats_time = high_resolution_clock::now();
+                        #endif
+                        post_iq_data_nocurl(detect_buff, detect_buff.size(), detect_channel, opensas_url + "samples");
+                        #if STATS
+                        detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
+                        std::cout << "Https req time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
+                        #endif
+                    // }
+                    observe_duration = (high_resolution_clock::now() - observe_time);
+                    //Print observe duration
+                    std::cout << "Observe duration: " << observe_duration.count() / 1000 << " us" << std::endl;
                 }
-                #if STATS
-                detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
-                std::cout << "Samples recv time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
-                #endif
-                
-                post_power_data(data, opensas_url + "measurements");
-                #if STATS
-                detection_stats_time = high_resolution_clock::now();
-                #endif
-                post_iq_data_nocurl(detect_buff, detect_buff.size(), detect_channel, opensas_url + "samples");
-                #if STATS
-                detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
-                std::cout << "Https req time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
-                #endif
+
                 //Change sample rate back to 122.88 MHz
                 std::cout << boost::format("Setting RX Rate: %f Msps...") % (122.88e6 / 1e6) << std::endl;
                 usrp->set_rx_rate(122.88e6);
                 std::cout << boost::format("Actual RX Rate: %f Msps...") % (usrp->get_rx_rate() / 1e6)
                         << std::endl
                         << std::endl;
-                iq_data_sent_time  = high_resolution_clock::now()
+                if(!observe)
+                    iq_data_sent_time  = high_resolution_clock::now()
                         + std::chrono::microseconds(int64_t(50e3));
                 #if STATS
                 detection_stats_time = high_resolution_clock::now();
@@ -463,6 +490,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
                 detection_stats_duration = (high_resolution_clock::now() - detection_stats_time);
                 std::cout << "Freq return time: "  << detection_stats_duration.count() / 1000 << " us" << std::endl;
                 #endif
+                
             }
         }
     }
@@ -494,13 +522,16 @@ int compute_average_on_bins(float *dft, size_t len){
     float max = -100;
     // Calculate average of first 34 elements
     int step = 41;
+    float temp_avg = 0;
 
     for (int i = channel_offset; i < num_averages-1; i++) {
         double sum = 0;
         for (int j = ((i - channel_offset + skip_steps)  * step) + start_point; j < (i + 1 - channel_offset + skip_steps) * step + start_point; j++) {
             sum = sum + dft[j];
         }
-        data.channel_pwr[i] = sum / step;
+        temp_avg = sum / step;
+        // Use FFT_AVERAGES to determine the number of averages to take
+        data.channel_pwr[i] = (data.channel_pwr[i] * (num_avgs - 1) + temp_avg) / num_avgs;
         #if DEBUG
         std::cout << " Ch = " << i;
         std::cout << " " << data.channel_pwr[i];
@@ -516,14 +547,17 @@ int compute_average_on_bins(float *dft, size_t len){
         }
     }
 
-    // Calculate average of last 34 elements, excluding the last element
+    // Calculate average of last "step" elements, excluding the last element
     double sum = 0;
     for (int i = len-(step * (skip_steps+1))-end_point_offset; i < len-(step * (skip_steps)) - end_point_offset; i++) {
         sum += dft[i];
     }
+    temp_avg = sum / step;
+    // Use FFT_AVERAGES to determine the number of averages to take
+    data.channel_pwr[num_averages-1] = (data.channel_pwr[num_averages-1] * (num_avgs - 1) + temp_avg) / num_avgs;
+
     // Check if the last element is above the threshold
-    data.channel_pwr[num_averages-1] = sum / step;
-    if(data.channel_pwr[num_averages-1] > -60){
+    if(data.channel_pwr[num_averages-1] > DETECTION_THRESHOLD){
         if(data.channel_pwr[num_averages-1] > max){
             max = data.channel_pwr[num_averages-1];
             detect_channel = num_averages-1;
@@ -574,9 +608,15 @@ void post_power_data(channel_data data, std::string url) {
     json_ss << "\"lon\":" << data.lon << ",";
     json_ss << "\"channels\":[";
     for (int i = 0; i < 14; i++) {
-        json_ss << "{\"name\":\"channel" << i << "\",\"power\":" << data.channel_pwr[i] << "},";
+        if(data.channel_pwr[i] > DETECTION_THRESHOLD)
+            json_ss << "{\"id\":" << i << ",\"power\":" << data.channel_pwr[i] << ",\"detected\":true,\"signal\":\"unknown\"},";
+        else
+            json_ss << "{\"id\":" << i << ",\"power\":" << data.channel_pwr[i] << ",\"detected\":false,\"signal\":\"unknown\"},";
     }
-    json_ss << "{\"name\":\"channel14\",\"power\":" << data.channel_pwr[14] << "}";
+    if(data.channel_pwr[14] > DETECTION_THRESHOLD)
+        json_ss << "{\"id\":14,\"power\":" << data.channel_pwr[14] << ",\"detected\":true,\"signal\":\"unknown\"}";
+    else
+        json_ss << "{\"id\":14,\"power\":" << data.channel_pwr[14] << ",\"detected\":false,\"signal\":\"unknown\"}";
     json_ss << "]}";
 
     std::string json_str = json_ss.str();
