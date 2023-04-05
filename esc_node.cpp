@@ -6,6 +6,7 @@
 //
 
 //Modified by Oren Rodney Collaco
+// ESC sensor node
 
 #include "esc_dft.hpp" //implementation
 #include <uhd/usrp/multi_usrp.hpp>
@@ -750,6 +751,15 @@ void post_json(std::string json_str, std::string url) {
         return;
     }
 
+    // Set a timeout for the socket
+    struct timeval timeout;
+    timeout.tv_sec = 5;  // 5 seconds timeout
+    timeout.tv_usec = 0;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
+        perror("ERROR setting socket options");
+        return;
+    }
+
     // Set the server address
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
@@ -791,8 +801,20 @@ void post_json(std::string json_str, std::string url) {
     // Read the response from the server
     char buffer[1024];
     int bytes_read = SSL_read(ssl, buffer, sizeof(buffer));
-    if (bytes_read < 0) {
-        perror("ERROR reading from socket");
+
+    // Check if any data was received
+    if (bytes_read <= 0) {
+        if (bytes_read == 0) {
+            std::cerr << "ERROR: Server closed the connection" << std::endl;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            std::cerr << "ERROR: Timeout while reading from socket" << std::endl;
+        } else {
+            perror("ERROR reading from socket");
+        }
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        close(sockfd);
         return;
     }
 
