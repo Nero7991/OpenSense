@@ -29,7 +29,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <mutex>
-
+// For different N310 as ESC node, use different node numbers
 #define SENSOR_NODE 1
 #define FFT_AVERAGES 2
 
@@ -37,7 +37,7 @@
 std::string client_crt_path = "../certs/client_10.147.20.75-0.crt"; 
 std::string client_key_path = "../certs/client_10.147.20.75-0.key"; 
 std::string ca_crt_path = "../certs/ca.crt";
-
+// Path to Open-SAS URL
 std::string opensas_url = "https://10.147.20.75:1443/sas-api/";
 
 #define FFT_ON_FPGA 0
